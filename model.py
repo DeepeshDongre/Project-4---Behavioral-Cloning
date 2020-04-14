@@ -1,282 +1,231 @@
+import pandas as pd
 import numpy as np
-import keras
+import matplotlib
 import matplotlib.pyplot as plt
-import csv
-import cv2
+import os
+import sys
 from sklearn.model_selection import train_test_split
 from sklearn.utils import shuffle
+import cv2
+from keras.models import load_model
+from keras.models import Sequential
+from keras.layers import Dense, Activation, Dropout,Convolution2D,MaxPooling2D,Flatten,Lambda
+from keras.optimizers import Adam
+from keras.models import model_from_json
+import json
+#########################3
+import keras
+import csv
 from keras.models import *
 from keras.layers import *
-from keras.optimizers import Adam
 from keras.preprocessing.image import ImageDataGenerator
 
+matplotlib.style.use('ggplot')
+
+# Define the path for Image data set
 folder = './data/'
 path = folder + 'driving_log.csv'
 
-rows = 66
-cols = 200
+model_json = 'model.json'
+model_weights = 'model.h5'
+
+#Dimensions for image size
+rows = 64
+cols = 64
+
+# Define epochs and Batch Size
+nb_epoch = 25
+batch_size= 32
+
+#col_names = ['center', 'left','right','steerpying','throttle','brake','speed']
+#training_dat = pd.read_csv(data_dir+data_csv,names=None)
+training_dat = pd.read_csv(path,names=None)
+training_dat.head()
 
 
-batch_size = 32
-nb_epoch = 50
+training_dat[['left','center','right']]
+X_train = training_dat[['left','center','right']]
+Y_train = training_dat['steering']
 
-log_tokens = []
-with open(path,'rt') as f:
-    reader = csv.reader(f)
-    for line in reader:
-        log_tokens.append(line)
-log_labels = log_tokens.pop(0)
+X_train, X_val, Y_train, Y_val = train_test_split(X_train, Y_train, test_size=0.1, random_state=42)
 
-###########################################################    
+# get rid of the pandas index after shuffling
+X_left  = X_train['left'].as_matrix()
+X_right = X_train['right'].as_matrix()
+X_train = X_train['center'].as_matrix()
+X_val   = X_val['center'].as_matrix()
+Y_val   = Y_val.as_matrix()
+Y_train = Y_train.as_matrix()
 
-# Resize the training images to remove irrelevant data from the top portion and the Car bonnet from bottom
-def crop_image(image):
-    #New sizes for image, 
-    col, row = 200,66
+Y_train = Y_train.astype(np.float32)
+Y_val   = Y_val.astype(np.float32)
+
+
+def read_next_image(m,lcr,X_train,X_left,X_right,Y_train):
+    # assume the side cameras are about 1.2 meters off the center and the offset to the left or right 
+    # should be be corrected over the next dist meters, calculate the change in steering control
+    # using tan(alpha)=alpha
+
+    offset=1.0 
+    dist=20.0
+    steering = Y_train[m]
+    if lcr == 0:
+               
+        image_path = folder+(X_left[m].strip(' '))
+        image = plt.imread(image_path)  
+        dsteering = offset/dist * 360/( 2*np.pi) / 25.0
+        steering += dsteering
+    elif lcr == 1:
+               
+        image_path = folder+(X_train[m].strip(' '))
+        image = plt.imread(image_path)                                    
+                      
+    elif lcr == 2:
+              
+        image_path = folder +(X_right[m].strip(' '))
+        image = plt.imread(image_path)  
+        dsteering = -offset/dist * 360/( 2*np.pi)  / 25.0
+        steering += dsteering
+    else:
+        print ('Invalid lcr value :',lcr )
     
+    return image,steering
+
+def random_crop(image,steering=0.0,tx_lower=-20,tx_upper=20,ty_lower=-2,ty_upper=2,rand=True):
+    # we will randomly crop subsections of the image and use them as our data set.
+    # also the input to the network will need to be cropped, but of course not randomly and centered.
     shape = image.shape
+    col_start,col_end =abs(tx_lower),shape[1]-tx_upper
+    horizon=60;
+    bonnet=136
+    if rand:
+        tx= np.random.randint(tx_lower,tx_upper+1)
+        ty= np.random.randint(ty_lower,ty_upper+1)
+    else:
+        tx,ty=0,0
     
-    #Cut off the sky and tree portion from the original picture
-    crop_up = int(shape[0]/5)
+    #    print('tx = ',tx,'ty = ',ty)
+    random_crop = image[horizon+ty:bonnet+ty,col_start+tx:col_end+tx,:]
+    image = cv2.resize(random_crop,(64,64),cv2.INTER_AREA)
+    # the steering variable needs to be updated to counteract the shift 
+    if tx_lower != tx_upper:
+        dsteering = -tx/(tx_upper-tx_lower)/3.0
+    else:
+        dsteering = 0
+    steering += dsteering
     
-    #Cut off the Bottom front of the car
-    crop_down = int(shape[0]-25)
+    return image,steering
 
-    image = image[crop_up:crop_down, 0:shape[1]]
-    image = cv2.resize(image,(col,row), interpolation=cv2.INTER_AREA)    
-    return image
-########### End of Crop image function ################
-
-##### Image file preprocessing ############
-def preprocess_color(image):
-  # Preprocessing image files and augmenting
-  
-    image = cv2.cvtColor(image,cv2.COLOR_BGR2RGB)
+def random_shear(image,steering,shear_range):
+    rows,cols,ch = image.shape
+    dx = np.random.randint(-shear_range,shear_range+1)
+    #    print('dx',dx)
+    random_point = [cols/2+dx,rows/2]
+    pts1 = np.float32([[0,rows],[cols,rows],[cols/2,rows/2]])
+    pts2 = np.float32([[0,rows],[cols,rows],random_point])
+    dsteering = dx/(rows/2) * 360/(2*np.pi*25.0) / 6.0    
+    M = cv2.getAffineTransform(pts1,pts2)
+    image = cv2.warpAffine(image,M,(cols,rows),borderMode=1)
+    steering +=dsteering
     
-    return image
-########### End of preprocess_image_file_color() ###############
+    return image,steering
 
-##### Image file preprocessing ############
-def preprocess_flipYaxis(image):
-    # flip the image on Y-axis for augumentation
-    
-    image = cv2.flip(image, 1)
-    
-    return image
-########### End of preprocess_flipYaxis() ###############
-
-##### Image file preprocessing and Augumentation Brightness ############
-def preprocess_brightness_camera_images(image):
+def random_brightness(image):
     image1 = cv2.cvtColor(image,cv2.COLOR_RGB2HSV)
-    image1 = np.array(image1, dtype = np.float64)
-    random_bright = .5+np.random.uniform()
+    random_bright = 0.8 + 0.4*(2*np.random.uniform()-1.0)    
     image1[:,:,2] = image1[:,:,2]*random_bright
-    image1[:,:,2][image1[:,:,2]>255]  = 255
-    image1 = np.array(image1, dtype = np.uint8)
     image1 = cv2.cvtColor(image1,cv2.COLOR_HSV2RGB)
     return image1
 
-########### End of preprocess_Brightness ###############
+def random_flip(image,steering):
+    coin=np.random.randint(0,2)
+    if coin==0:
+        image,steering=cv2.flip(image,1),-steering
+    return image,steering
+        
 
-##### Image file preprocessing and Augumentation Horizontal and Vertical Shifts ############
-def trans_image(image,steer,trans_range):
-    # Translation
-    tr_x = trans_range*np.random.uniform()-trans_range/2
-    steer_ang = steer + tr_x/trans_range*2*.2
-    tr_y = 40*np.random.uniform()-40/2
-    #tr_y = 0
-    Trans_M = np.float32([[1,0,tr_x],[0,1,tr_y]])
-    image_tr = cv2.warpAffine(image,Trans_M,(cols,rows))
-    
-    return image_tr,steer_ang
-########### End of preprocess_Horizontal and Vertical shifts ###############
+def training_image_generator(X_train,X_left,X_right,Y_train):
+    m = np.random.randint(0,len(Y_train))
+#    print('training example m :',m)
+    lcr = np.random.randint(0,3)
+    #lcr = 1
+#    print('left_center_right  :',lcr)
+    image,steering = read_next_image(m,lcr,X_train,X_left,X_right,Y_train)
 
-##### Image file preprocessing and Augumentation Random Shadow ############
-
-def preprocess_random_shadow(image):
-    top_y = 200*np.random.uniform()
-    top_x = 0
-    bot_x = 66
-    bot_y = 200*np.random.uniform()
-    image_hls = cv2.cvtColor(image,cv2.COLOR_RGB2HLS)
-    shadow_mask = 0*image_hls[:,:,1]
-    X_m = np.mgrid[0:image.shape[0],0:image.shape[1]][0]
-    Y_m = np.mgrid[0:image.shape[0],0:image.shape[1]][1]
-    shadow_mask[((X_m-top_x)*(bot_y-top_y) -(bot_x - top_x)*(Y_m-top_y) >=0)]=1
-    #random_bright = .25+.7*np.random.uniform()
-    if np.random.randint(2)==1:
-        random_bright = .5
-        cond1 = shadow_mask==1
-        cond0 = shadow_mask==0
-        if np.random.randint(2)==1:
-            image_hls[:,:,1][cond1] = image_hls[:,:,1][cond1]*random_bright
-        else:
-            image_hls[:,:,1][cond0] = image_hls[:,:,1][cond0]*random_bright    
-    image = cv2.cvtColor(image_hls,cv2.COLOR_HLS2RGB)
-    return image
-
-########### End of preprocess_Random Shadow ###############
-
-def data_loading(imgs,steering,folder,correction=0.08):
-# Loading log tokens    
-    log_tokens = []
-    with open(path,'rt') as f:
-        reader = csv.reader(f)
-        for line in reader:
-            log_tokens.append(line)
-    log_labels = log_tokens.pop(0)
-
-# Using for loop for loading and appending centre images with steering angles
-    for i in range(len(log_tokens)):
-        img_path = log_tokens[i][0]
-        img_path = folder+'IMG'+(img_path.split('IMG')[1]).strip()
-        img = plt.imread(img_path)
-        
-        #Call crop function to remove irrelevant part from image
-        img = crop_image(img)        
-        imgs.append(img)
-        steering.append(float(log_tokens[i][3]))
-        
-     
-        img = preprocess_color(img)
-        imgs.append(img)
-        steering.append(float(log_tokens[i][3]))
-        
-        img = preprocess_brightness_camera_images(img)
-        imgs.append(img)
-        steering.append(float(log_tokens[i][3]))
-        
-        img = preprocess_random_shadow(img)
-        imgs.append(img)
-        steering.append(float(log_tokens[i][3]))
-        
-        
-# Using for loop for loading and appending left images with steering angles and adding a little correction
-    for i in range(len(log_tokens)):
-        img_path = log_tokens[i][1]
-        img_path = folder+'IMG'+(img_path.split('IMG')[1]).strip()
-        img = plt.imread(img_path)
-        
-        #Call crop function to remove irrelevant part from image
-        img = crop_image(img)
-        
-        imgs.append(img)
-        steering.append(float(log_tokens[i][3]) + correction)
-        
-        img = preprocess_flipYaxis(img)
-        imgs.append(img)
-        steering.append(-1.*float(log_tokens[i][3]))
-        
-        img = preprocess_brightness_camera_images(img)
-        imgs.append(img)
-        steering.append(float(log_tokens[i][3]) + correction)
-        
-        img = preprocess_random_shadow(img)
-        imgs.append(img)
-        steering.append(float(log_tokens[i][3]))
-        
-# Using for loop for loading and appending right images with steering angles and subtracting a little correction
-    for i in range(len(log_tokens)):
-        img_path = log_tokens[i][2]
-        img_path = folder+'IMG'+(img_path.split('IMG')[1]).strip()
-        img = plt.imread(img_path)
-        
-        #Call crop function to remove irrelevant part from image
-        img = crop_image(img)
-        
-        imgs.append(img)
-        steering.append(float(log_tokens[i][3]) - correction)
-        
-        img = preprocess_flipYaxis(img)
-        imgs.append(img)
-        steering.append(-1.*float(log_tokens[i][3]))
-        
-        img = preprocess_brightness_camera_images(img)
-        imgs.append(img)
-        steering.append(float(log_tokens[i][3]) + correction)
-        
-        img = preprocess_random_shadow(img)
-        imgs.append(img)
-        steering.append(float(log_tokens[i][3]))
-        
-def main():
-    # Loading data    
-    images_train = np.array(data['Images']).astype('float32')
-    steering_train = np.array(data['Steering']).astype('float32')
-    
-    # shuffling the data for avoiding overfit
-    X_train, y_train = shuffle(images_train, steering_train)
-    X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, random_state=0, test_size=0.2)
-    
-    # reshaping the shape of the images to the ones we want to input here it is 16X16
-    X_train = X_train.reshape(X_train.shape[0], rows, cols, 3)
-    X_val = X_val.reshape(X_val.shape[0], rows, cols, 3)
-    
-    ################## Referred from KERAS Documentation - https://keras.io/preprocessing/image/ ################
-    train_datagen = ImageDataGenerator(
-        width_shift_range=0.1,
-        height_shift_range=0.02,
-        fill_mode='nearest')    
-    
-    train_generator = train_datagen.flow(X_train, y_train, batch_size)  
-
-    valid_datagen = ImageDataGenerator()
-
-    validation_generator = valid_datagen.flow(X_val, y_val, batch_size)
+    image,steering = random_shear(image,steering,shear_range=100)
    
-    # the model is referred from NVIDIA's "End to End Learning for Self-Driving Cars" paper
+    image,steering = random_crop(image,steering,tx_lower=-20,tx_upper=20,ty_lower=-10,ty_upper=10)
 
-    model = Sequential()
-    model.add(Lambda(lambda x:x/127.5 -1., input_shape = (rows,cols,3)))   
-    model.add(Cropping2D(cropping=((70,25),(0,0))))   # trim image to only see section with road
-    model.add(Conv2D(24,(5,5),input_shape=(rows,cols,3),padding = 'valid' ))
-    model.add(ELU())
-    model.add(Conv2D(36,(5,5), padding ='valid',strides =(2,2)))
-    model.add(ELU())
-    model.add(Conv2D(48,(5,5), padding ='valid',strides=(2,2)))
-    model.add(ELU())
-    model.add(Conv2D(64,(3,3), padding ='valid',strides=(1,1)))
-    model.add(ELU())
-    model.add(Conv2D(64,(3,3), padding ='valid',strides=(1,1)))
-    model.add(ELU()) #Change -1
-    model.add(Flatten())
-    model.add(Dropout(0.5)) #Change -2 : Add dropout
-    model.add(Dense(1164,kernel_initializer ='he_normal'))
-    model.add(ELU())
-    model.add(Dense(100,kernel_initializer='he_normal'))
-    model.add(ELU())
-    model.add(Dense(50,kernel_initializer ='he_normal'))
-    model.add(ELU())
-    model.add(Dropout(0.5)) #Change -3 : Add dropout
-    model.add(Dense(10,kernel_initializer ='he_normal'))
-    model.add(ELU())
-    model.add(Dense(1,name='output',kernel_initializer = 'he_normal'))
+    image,steering = random_flip(image,steering)
     
-    model.summary()
-    # loss-mse and optimizer-adam
-    model.compile(loss='mean_squared_error',optimizer='adam')
+    image = random_brightness(image)
+    
+    return image,steering
+
+def get_validation_set(X_val,Y_val):
+    X = np.zeros((len(X_val),64,64,3))
+    Y = np.zeros(len(X_val))
+    for i in range(len(X_val)):
+        x,y = read_next_image(i,1,X_val,X_val,X_val,Y_val)
+        X[i],Y[i] = random_crop(x,y,tx_lower=0,tx_upper=0,ty_lower=0,ty_upper=0)
+    return X,Y
+    
+
+def train_batch_generator(X_train,X_left,X_right,Y_train,batch_size = 32):
+    
+    batch_images = np.zeros((batch_size, 64, 64, 3))
+    batch_steering = np.zeros(batch_size)
+    while 1:
+        for i_batch in range(batch_size):
+            x,y = training_image_generator(X_train,X_left,X_right,Y_train)
+            batch_images[i_batch] = x
+            batch_steering[i_batch] = y
+        yield batch_images, batch_steering
         
-    #### Model fit generator ##########
-    # train the network
-    
-       
-    model.fit_generator(
-        train_generator,
-        steps_per_epoch = len(X_train)/batch_size,
-        epochs = nb_epoch,
-        validation_data = validation_generator,
-        validation_steps = batch_size)
-    
-      
-    #saving the model
-    model.save("model.h5")
-    print("Model saved.")
-    
-if __name__ == '__main__':
-    
-    data={}
-    data['Images'] = []
-    data['Steering'] = []
 
-    data_loading(data['Images'], data['Steering'],folder,0.3)
-    main()
+train_generator = train_batch_generator(X_train,X_left,X_right,Y_train,batch_size)
+X_val,Y_val = get_validation_set(X_val,Y_val)
+
+## Model Implementation
+model = Sequential()
+model.add(Lambda(lambda x:x/127.5 -1., input_shape = (rows,cols,3)))  #Lambda layer for normalization
+model.add(Conv2D(24,(5,5),input_shape=(rows,cols,3),padding = 'valid' ))
+model.add(ELU())
+model.add(Conv2D(36,(5,5), padding ='valid',strides =(2,2)))
+model.add(ELU())
+model.add(Conv2D(48,(5,5), padding ='valid',strides=(2,2)))
+model.add(ELU())
+model.add(Conv2D(64,(3,3), padding ='valid',strides=(1,1)))
+model.add(ELU())
+model.add(Conv2D(64,(3,3), padding ='valid',strides=(1,1)))
+model.add(ELU()) #Change -1
+model.add(Flatten())
+model.add(Dropout(0.5)) #Change -2 : Add dropout
+model.add(Dense(1164,kernel_initializer ='he_normal'))
+model.add(ELU())
+model.add(Dense(100,kernel_initializer='he_normal'))
+model.add(ELU())
+model.add(Dense(50,kernel_initializer ='he_normal'))
+model.add(ELU())
+model.add(Dropout(0.5)) #Change -3 : Add dropout
+model.add(Dense(10,kernel_initializer ='he_normal'))
+model.add(ELU())
+model.add(Dense(1,name='output',kernel_initializer = 'he_normal'))
+    
+model.summary()
+    
+# loss-mse and optimizer-adam
+model.compile(loss='mean_squared_error',optimizer='adam')
+
+model.fit_generator(
+    train_generator,
+    steps_per_epoch = len(X_train)/batch_size,
+    epochs = nb_epoch,
+    validation_data = (X_val,Y_val),verbose=1,
+    validation_steps = batch_size)
+        
+#saving the model
+model.save("model.h5")
+print("Model saved.")
+print("Model Save Completed........")
+    

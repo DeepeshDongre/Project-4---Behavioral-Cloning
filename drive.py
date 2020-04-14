@@ -4,6 +4,7 @@ from datetime import datetime
 import os
 import shutil
 
+import cv2
 import numpy as np
 import socketio
 import eventlet
@@ -21,6 +22,37 @@ app = Flask(__name__)
 model = None
 prev_image_array = None
 
+# Resize the training images to remove irrelevant data from the top portion and the Car bonnet from bottom
+img_rows,img_cols=64,64
+
+def random_crop(image,steering=0.0,tx_lower=-20,tx_upper=20,ty_lower=-2,ty_upper=2,rand=True):
+    # we will randomly crop subsections of the image and use them as our data set.
+    # also the input to the network will need to be cropped, but of course not randomly and centered.
+    shape = image.shape
+    col_start,col_end =abs(tx_lower),shape[1]-tx_upper
+    horizon=60;
+    bonnet=136
+    if rand:
+        tx= np.random.randint(tx_lower,tx_upper+1)
+        ty= np.random.randint(ty_lower,ty_upper+1)
+    else:
+        tx,ty=0,0
+    
+    #    print('tx = ',tx,'ty = ',ty)
+    random_crop = image[horizon+ty:bonnet+ty,col_start+tx:col_end+tx,:]
+    image = cv2.resize(random_crop,(64,64),cv2.INTER_AREA)
+    # the steering variable needs to be updated to counteract the shift 
+    if tx_lower != tx_upper:
+        dsteering = -tx/(tx_upper-tx_lower)/20.0
+    else:
+        dsteering = 0
+    steering += dsteering
+    
+    return image,steering
+
+
+
+########### End of Crop image function ################
 
 class SimplePIController:
     def __init__(self, Kp, Ki):
@@ -42,7 +74,7 @@ class SimplePIController:
 
         return self.Kp * self.error + self.Ki * self.integral
 
-
+    
 controller = SimplePIController(0.1, 0.002)
 set_speed = 9
 controller.set_desired(set_speed)
@@ -61,9 +93,17 @@ def telemetry(sid, data):
         imgString = data["image"]
         image = Image.open(BytesIO(base64.b64decode(imgString)))
         image_array = np.asarray(image)
+        
+        #Modified to resize the image
+        #image_array = crop_image(image_array)
+        image_array,_ = random_crop(image_array,rand = False)
+        
+        transformed_image_array = image_array[None, :, :, :]
+        
         steering_angle = float(model.predict(image_array[None, :, :, :], batch_size=1))
 
-        throttle = controller.update(float(speed))
+        #throttle = controller.update(float(speed))
+        throttle = 0.3
 
         print(steering_angle, throttle)
         send_control(steering_angle, throttle)
